@@ -1,0 +1,9 @@
+# Secrets / credentials — never commit real tokens or env files
+.env
+.env.*
+*.pat
+*.token
+*credentials*
+
+# Temp files written by the Jenkins pipeline at runtime
+.tmp_*.json

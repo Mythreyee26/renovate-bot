@@ -1,0 +1,974 @@
+pipeline {
+    agent {
+        kubernetes {
+            defaultContainer 'renovate'
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: renovate-jenkins-
+spec:
+  serviceAccountName: renovate-jenkins-sa
+  containers:
+  - name: renovate
+    image: renovate/renovate:38-full
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+  - name: resolver
+    image: python:3.11-slim
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+"""
+        }
+    }
+
+    environment {
+        RENOVATE_PLATFORM    = 'gitlab'
+        RENOVATE_ENDPOINT    = 'https://gitlab.example.com/api/v4/'
+        RENOVATE_CONFIG_FILE = 'renovate-bot/renovate-config.js'
+        LOG_LEVEL            = 'debug'
+        RENOVATE_TOKEN       = credentials('renovate-bot-pat')
+        GITLAB_TOKEN         = credentials('renovate-bot-pat')
+        GITLAB_API           = 'https://gitlab.example.com/api/v4'
+        RENOVATE_AUTODISCOVER          = 'false'
+        RENOVATE_REPOSITORY_CACHE      = 'enabled'
+    }
+
+    stages {
+
+        stage('Checkout Repo') {
+            steps { checkout scm }
+        }
+
+        stage('Run Renovate') {
+            steps {
+                container('renovate') {
+                    sh '''
+                        echo "Token length: ${#RENOVATE_TOKEN}"
+                        renovate
+                    '''
+                }
+            }
+        }
+
+        stage('Install Resolver Tools') {
+            steps {
+                container('resolver') {
+                    sh '''
+                        apt-get update -qq && apt-get install -y -qq curl git jq > /dev/null 2>&1
+                        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - > /dev/null 2>&1
+                        apt-get install -y -qq nodejs maven > /dev/null 2>&1
+                        git config --global user.email "renovate-bot@example.com"
+                        git config --global user.name "renovate-bot"
+                        echo "=== Resolver tools installed ==="
+                        python3 --version && node --version && npm --version && mvn --version | head -1
+                    '''
+                }
+            }
+        }
+
+        stage('Compatibility Test & Automerge Patches') {
+            steps {
+                container('resolver') {
+                    script {
+                        def output = sh(
+                            script: '''
+                                set +e
+                                echo "=== Pre-clean ==="
+                                rm -rf /tmp/* || true
+                                npm cache clean --force || true
+                                rm -rf ~/.m2/repository/* || true
+
+                                chmod +x renovate-bot/compatibility-test.sh
+                                renovate-bot/compatibility-test.sh
+
+                                echo "=== Post-clean ==="
+                                rm -rf /tmp/* || true
+                                npm cache clean --force || true
+                                rm -rf ~/.m2/repository/* || true
+                               
+                            ''',
+                            returnStdout: true
+                        ).trim()
+                        echo output  // still print to Jenkins console
+                        env.COMPAT_LOG = output  // store for email stage
+                    }
+                }
+            }
+        }
+
+        stage('Send Renovate Notification Emails') {
+            steps {
+                container('resolver') {
+                    script {
+                        sendRenovateEmails()
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always  { echo '\n==========================================\nPIPELINE FINISHED\n==========================================\n' }
+        success { echo 'Status: SUCCESS' }
+        failure { echo 'Status: FAILED — check logs above' }
+        unstable{ echo 'Status: UNSTABLE — some reviewer emails skipped' }
+    }
+}
+
+// ================================================================
+//  MAIN EMAIL ORCHESTRATOR
+// ================================================================
+
+def sendRenovateEmails() {
+
+    def gitlabHost             = 'https://gitlab.example.com'
+    def botUsername             = 'renovate-bot'
+    def gitlabApi              = "${gitlabHost}/api/v4"
+
+    // ── Pipeline start time as boundary for "new" and automerge ──
+    def pipelineStartMillis = currentBuild.startTimeInMillis
+    def pipelineStartDate   = new Date(pipelineStartMillis)
+    log 'INFO', "Pipeline started at: ${pipelineStartDate.format('yyyy-MM-dd HH:mm z')}"
+
+    // ── Load configs ─────────────────────────────────────────────
+    def repositories   = parseRepositoriesFromConfig('renovate-bot/renovate-config.js')
+    def emailsConfig   = readJSON file: 'renovate-bot/renovate-reviewer-emails.json'
+    def reviewerConfig = readJSON file: 'renovate-bot/renovate-reviewers.json'
+
+    def lead           = parseLead(emailsConfig)
+    def reviewerEmails = emailsConfig['reviewers']
+    if (!reviewerEmails) { error "Missing 'reviewers' block in renovate-reviewer-emails.json" }
+    def globalCcMap = emailsConfig['cc'] ?: [:]
+
+    def reviewerRules = reviewerConfig['reviewerRules'] ?: []
+    def repoRules     = reviewerRules.findAll { rule ->
+        !(rule['isLead']?.toString() == 'true') && rule['matchRepositories']
+    }
+    def dockerRules   = reviewerRules.findAll { rule ->
+        !(rule['isLead']?.toString() == 'true') &&
+        rule['matchManagers']?.contains('dockerfile')
+    }
+
+    log 'INFO', "Repo rules: ${repoRules.size()} | Docker rules: ${dockerRules.size()}"
+
+    // ── Repo filter ──────────────────────────────────────────────
+    def repoFilter = repositories.collect { it.toLowerCase() }
+
+    // ── Fetch open MRs ───────────────────────────────────────────
+    def mrList = fetchAllMRs(gitlabApi, botUsername, 'opened')
+    log 'INFO', "Total open MRs (before filter): ${mrList.size()}"
+
+    if (repositories) {
+        mrList = mrList.findAll { mr -> matchesRepository(mr, repoFilter) }
+        log 'INFO', "Total open MRs (after filter): ${mrList.size()}"
+    }
+
+    // ── Resolve project IDs ──────────────────────────────────────
+    def projectIdToPath = resolveProjectIds(mrList, repositories, gitlabApi)
+    log 'INFO', "Project IDs resolved: ${projectIdToPath}"
+
+    // Fetch auto-merged patches using pipeline start time ──
+    def automergedPatches = fetchAutomergedPatches(
+        projectIdToPath, gitlabApi, botUsername, pipelineStartDate
+    )
+    if (repositories) {
+        automergedPatches = automergedPatches.findAll { mr -> matchesRepository(mr, repoFilter) }
+    }
+    log 'INFO', "Auto-merged patch MRs (since pipeline start): ${automergedPatches.size()}"
+
+    automergedPatches.each { mr ->
+        log 'DEBUG', "Automerged: !${mr['iid']} | branch: ${mr['source_branch']} | merged_at: ${mr['merged_at']} | labels: ${mr['labels']}"
+    }
+
+    // ── No MRs at all → status email & exit ──────────────────────
+    if (!mrList && !automergedPatches) {
+        log 'INFO', 'No open or recently merged MRs — sending status email to lead.'
+        sendMail(
+            to     : lead.email,
+            cc     : lead.cc ?: '',
+            subject: '[Renovate] No Open Dependency MRs',
+            body   : renderNoMrEmail(botUsername, env.BUILD_URL, env.BUILD_NUMBER)
+        )
+        return
+    }
+
+    // ── Classify using pipeline start time ───────────────────────
+    def enrichedMRs         = []
+    def repoReviewerToMRs   = [:]
+    def dockerReviewerToMRs = [:]
+
+    mrList.each { mr ->
+        def enriched = enrichOpenMR(mr, pipelineStartDate, repoRules, dockerRules)
+        enrichedMRs << enriched
+
+        // Docker MRs go ONLY to docker reviewers, repo MRs go ONLY to repo reviewers ──
+        if (enriched.isDockerMR) {
+            enriched.dockerReviewers.each { username ->
+                if (username.equalsIgnoreCase(lead.username)) return
+                if (!dockerReviewerToMRs.containsKey(username)) dockerReviewerToMRs[username] = []
+                dockerReviewerToMRs[username] << enriched
+            }
+        } else {
+            enriched.repoReviewers.each { username ->
+                if (username.equalsIgnoreCase(lead.username)) return
+                if (!repoReviewerToMRs.containsKey(username)) repoReviewerToMRs[username] = []
+                repoReviewerToMRs[username] << enriched
+            }
+        }
+    }
+
+    // ── Enrich auto-merged patches ───────────────────────────────
+    def enrichedAutomerged = automergedPatches.collect { mr -> enrichAutomergedMR(mr) }
+
+    // ── Compute summary counts ───────────────────────────────────
+    def counts = computeCounts(enrichedMRs, enrichedAutomerged)
+    logSummary(counts, lead.email, repoReviewerToMRs, dockerReviewerToMRs)
+
+    // ── Send lead email ──────────────────────────────────────────
+    sendMail(
+        to     : lead.email,
+        cc     : lead.cc ?: '',
+        subject: buildLeadSubject(counts),
+        body   : renderLeadEmail(
+            enrichedMRs, enrichedAutomerged, lead.username,
+            botUsername, env.BUILD_URL, env.BUILD_NUMBER
+        )
+    )
+    log 'INFO', "Lead email sent to: ${lead.email}"
+
+    // ── Send reviewer emails ─────────────────────────────────────
+    def emailsSent   = 0
+    def emailsFailed = 0
+
+    repoReviewerToMRs.each { username, mrs ->
+        def result = sendReviewerEmail(
+            username, mrs, 'repo', reviewerEmails, globalCcMap, lead.email
+        )
+        if (result) emailsSent++ else emailsFailed++
+    }
+
+    dockerReviewerToMRs.each { username, mrs ->
+        def result = sendReviewerEmail(
+            username, mrs, 'docker', reviewerEmails, globalCcMap, lead.email
+        )
+        if (result) emailsSent++ else emailsFailed++
+    }
+
+    log 'INFO', "Reviewer emails sent: ${emailsSent} | failed: ${emailsFailed}"
+    if (emailsFailed > 0) {
+        unstable("${emailsFailed} reviewer email(s) skipped — check WARN lines.")
+    }
+}
+
+// ================================================================
+//  CONFIG PARSERS
+// ================================================================
+
+def parseRepositoriesFromConfig(String configPath) {
+    def repos = []
+    try {
+        def configRaw = readFile file: configPath
+        def matcher   = configRaw =~ /repositories\s*:\s*\[([^\]]*?)\]/
+        if (matcher.find()) {
+            repos = matcher.group(1)
+                .split('\n')
+                .collect { line ->
+                    def ci = line.indexOf('//')
+                    ci >= 0 ? line.substring(0, ci) : line
+                }
+                .join(',')
+                .split(',')
+                .collect { it.replaceAll(/[\"\'\s]/, '').trim() }
+                .findAll { it }
+        }
+        log 'INFO', "[parseRepositoriesFromConfig] Found ${repos.size()} repos: ${repos}"
+    } catch (Exception e) {
+        log 'WARN', "[parseRepositoriesFromConfig] Failed: ${e.message}"
+    }
+    return repos
+}
+
+def parseLead(def emailsConfig) {
+    def lb = emailsConfig['lead']
+    if (!lb) { error "Missing 'lead' block in renovate-reviewer-emails.json" }
+    def username = lb['username']?.toString()?.trim()
+    def email    = lb['email']?.toString()?.trim()
+    def cc       = lb['cc']?.toString()?.trim()
+    if (!username) { error "Missing 'lead.username'" }
+    if (!email)    { error "Missing 'lead.email'" }
+    log 'INFO', "Lead: ${username} → ${email} (cc: ${cc ?: 'none'})"
+    return [username: username, email: email, cc: cc]
+}
+
+// ================================================================
+//  MR ENRICHMENT
+// ================================================================
+
+def enrichOpenMR(def mr, Date newMRCutoff, List repoRules, List dockerRules) {
+    def webUrl     = mr['web_url']?.toString() ?: ''
+    def repoName   = parseRepoName(webUrl)
+    def repoPath   = parseRepoPath(webUrl)
+    def branch     = mr['source_branch']?.toString() ?: ''
+    def title      = (mr['title']?.toString() ?: 'Untitled').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    def mrLabels   = mr['labels']?.collect { it.toString() } ?: []
+    def createdAt  = parseDate(mr['created_at']?.toString() ?: '')
+    def isNew      = createdAt ? !createdAt.before(newMRCutoff) : false
+    if (!createdAt) log 'WARN', "MR !${mr['iid']} has no created_at — classified as OLD"
+    def isDocker   = isDockerfileMR(branch, title, mrLabels)
+    def updateType = classifyUpdateType(mrLabels, branch, title)
+
+    // ── FIX 1: Dockerfile MRs get ONLY docker reviewers, non-Docker get ONLY repo reviewers ──
+    def repoReviewers   = []
+    def dockerReviewers = []
+    if (isDocker) {
+        dockerReviewers = dockerRules.collectMany { it['reviewers'] ?: [] }.unique()
+    } else {
+        repoReviewers = resolveRepoReviewers(repoPath, repoRules)
+    }
+
+    return [
+        iid            : mr['iid'],
+        project_id     : mr['project_id'],
+        title          : title,
+        link           : webUrl ?: '#',
+        branch         : branch,
+        repo           : repoName,
+        repoPath       : repoPath,
+        repoReviewers  : repoReviewers,
+        dockerReviewers: dockerReviewers,
+        updateType     : updateType,
+        isNew          : isNew,
+        isDockerMR     : isDocker,
+        createdAt      : mr['created_at']?.toString() ?: '',
+        isMerged       : false
+    ]
+}
+
+def enrichAutomergedMR(def mr) {
+    def webUrl   = mr['web_url']?.toString() ?: ''
+    def repoName = parseRepoName(webUrl)
+    def repoPath = parseRepoPath(webUrl)
+    def branch   = mr['source_branch']?.toString() ?: ''
+    def title    = (mr['title']?.toString() ?: 'Untitled').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    def mrLabels = mr['labels']?.collect { it.toString() } ?: []
+    def mergedAt = mr['merged_at']?.toString() ?: ''
+    def mergedAtFormatted = mergedAt
+    try {
+        def pd = parseDate(mergedAt)
+        if (pd) mergedAtFormatted = pd.format('yyyy-MM-dd HH:mm z')
+    } catch (Exception ignored) {}
+
+    return [
+        iid            : mr['iid'],
+        project_id     : mr['project_id'],
+        title          : title,
+        link           : webUrl ?: '#',
+        branch         : branch,
+        repo           : repoName,
+        repoPath       : repoPath,
+        repoReviewers  : [],
+        dockerReviewers: [],
+        updateType     : 'patch',
+        isNew          : false,
+        isDockerMR     : isDockerfileMR(branch, title, mrLabels),
+        createdAt      : mr['created_at']?.toString() ?: '',
+        mergedAt       : mergedAtFormatted,
+        isMerged       : true
+    ]
+}
+
+// ================================================================
+//  SUMMARY & COUNTS
+// ================================================================
+
+def computeCounts(List enrichedMRs, List enrichedAutomerged) {
+    return [
+        total      : enrichedMRs.size(),
+        newMRs     : enrichedMRs.findAll { it.isNew }.size(),
+        oldMRs     : enrichedMRs.findAll { !it.isNew }.size(),
+        major      : enrichedMRs.findAll { it.updateType == 'major' }.size(),
+        minor      : enrichedMRs.findAll { it.updateType == 'minor' }.size(),
+        patch      : enrichedMRs.findAll { it.updateType == 'patch' }.size(),
+        other      : enrichedMRs.findAll { it.updateType == 'other' }.size(),
+        docker     : enrichedMRs.findAll { it.isDockerMR }.size(),
+        automerged : enrichedAutomerged.size()
+    ]
+}
+
+def logSummary(Map c, String leadEmail, Map repoMap, Map dockerMap) {
+    log 'INFO', '============================================'
+    log 'INFO', "  Total open MRs        : ${c.total}"
+    log 'INFO', "  New (this pipeline)   : ${c.newMRs}"
+    log 'INFO', "  Old open              : ${c.oldMRs}"
+    log 'INFO', "  Major / Minor / Patch : ${c.major} / ${c.minor} / ${c.patch}"
+    log 'INFO', "  Other / Docker        : ${c.other} / ${c.docker}"
+    log 'INFO', "  Auto-merged patches   : ${c.automerged}"
+    log 'INFO', "  Repo reviewers        : ${repoMap.keySet().toList()}"
+    log 'INFO', "  Docker reviewers      : ${dockerMap.keySet().toList()}"
+    log 'INFO', "  Lead email            : ${leadEmail}"
+    log 'INFO', '============================================'
+}
+
+def buildLeadSubject(Map c) {
+    return "[Renovate] ${c.total} Open | ${c.newMRs} New | ${c.major} Major | ${c.minor} Minor | ${c.patch} Patch | ${c.automerged} Auto-merged"
+}
+
+// ================================================================
+//  REVIEWER EMAIL SENDER
+// ================================================================
+
+def sendReviewerEmail(String username, List mrs, String reviewType, def reviewerEmails, def globalCcMap, String leadEmail) {
+    def email = resolveEmail(reviewerEmails, username)
+    if (!email) {
+        log 'WARN', "SKIPPED ${reviewType} reviewer '${username}' — not in emails map"
+        return false
+    }
+    def cc = globalCcMap
+        .findAll { k, v -> v.toString() != email && v.toString() != leadEmail }
+        .values().collect { it.toString() }.join(',')
+
+    def isDocker = reviewType == 'docker'
+    def rCounts  = [
+        total : mrs.size(),
+        newMRs: mrs.findAll { it.isNew }.size(),
+        major : mrs.findAll { it.updateType == 'major' }.size(),
+        minor : mrs.findAll { it.updateType == 'minor' }.size(),
+        patch : mrs.findAll { it.updateType == 'patch' }.size(),
+        other : mrs.findAll { it.updateType == 'other' }.size()
+    ]
+    def typeLabel = isDocker ? 'Dockerfile MRs' : 'Open MRs'
+
+    try {
+        sendMail(
+            to     : email,
+            cc     : cc ?: '',
+            subject: "[Renovate] ${rCounts.total} ${typeLabel} Assigned | ${rCounts.newMRs} New | ${rCounts.major} Major | ${rCounts.minor} Minor | ${rCounts.patch} Patch",
+            body   : renderReviewerEmail(username, mrs, reviewType, env.BUILD_URL, env.BUILD_NUMBER)
+        )
+        log 'INFO', "[${reviewType.toUpperCase()}] Sent to ${email}"
+        return true
+    } catch (Exception e) {
+        log 'ERROR', "[${reviewType.toUpperCase()}] Failed for ${username}: ${e.message}"
+        return false
+    }
+}
+
+// ================================================================
+//  PROJECT RESOLUTION
+// ================================================================
+
+def resolveProjectIds(List mrList, List repositories, String gitlabApi) {
+    def projectIdToPath = [:]
+
+    mrList.each { mr ->
+        def pid    = mr['project_id']?.toString()
+        def webUrl = mr['web_url']?.toString() ?: ''
+        def rPath  = parseRepoPath(webUrl)
+        if (pid && rPath && rPath != 'unknown') {
+            projectIdToPath[pid] = rPath
+        }
+    }
+
+    if (repositories) {
+        repositories.each { filterEntry ->
+            def repoPathClean = filterEntry.endsWith('*') ? filterEntry[0..-2] : filterEntry
+            def alreadyKnown  = projectIdToPath.values().any { it.toLowerCase().startsWith(repoPathClean.toLowerCase()) }
+            if (!alreadyKnown) {
+                def encodedPath = repoPathClean.replace('/', '%2F')
+                def safeKey     = encodedPath.replace('%2F', '_').replace('%', '_')
+                try {
+                    def raw = sh(
+                        script: 'curl -sf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "' + gitlabApi + '/projects/' + encodedPath + '"',
+                        returnStdout: true
+                    ).trim()
+                    if (raw && raw != 'null') {
+                        writeFile file: ".tmp_proj_${safeKey}.json", text: raw
+                        def proj = readJSON file: ".tmp_proj_${safeKey}.json"
+                        def pid  = proj['id']?.toString()
+                        if (pid) projectIdToPath[pid] = proj['path_with_namespace']?.toString()
+                        }
+                } catch (Exception e) {
+                    log 'WARN', "[PROJECT LOOKUP] Failed for '${filterEntry}': ${e.message}"
+                }
+            }
+        }
+    }
+
+    log 'INFO', "Projects to scan (${projectIdToPath.size()}): ${projectIdToPath}"
+    return projectIdToPath
+}
+
+// ================================================================
+//  AUTOMERGED PATCH FETCHER
+// ================================================================
+
+def fetchAutomergedPatches(Map projectIdToPath, String gitlabApi, String botUsername, Date pipelineStartDate) {
+    def patches  = []
+    def seenKeys = [] as Set
+
+    projectIdToPath.each { projectId, repoPath ->
+        log 'INFO', "Scanning project ${projectId} (${repoPath}) for automerged patches since pipeline start"
+
+        def page = 1
+        def keepPaging = true
+        while (keepPaging && page <= 50) {
+            // order_by=updated_at (merged_at is NOT a valid GitLab API order_by value)
+            def url = "${gitlabApi}/projects/${projectId}/merge_requests?" +
+                      "state=merged" +
+                      "&per_page=50" +
+                      "&page=${page}" +
+                      "&order_by=updated_at" +
+                      "&sort=desc"
+
+            def raw = ''
+            try {
+                raw = sh(
+                    script: 'curl -sf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \'' + url + '\'',
+                    returnStdout: true
+                ).trim()
+            } catch (Exception e) {
+                log 'WARN', "Failed to fetch merged MRs for project ${projectId} page ${page}: ${e.message}"
+                break
+            }
+
+            if (!raw || raw == '[]') {
+                log 'DEBUG', "No results for project ${projectId} page ${page}"
+                break
+            }
+
+            def safeKey = "${projectId}_p${page}".replaceAll('[^a-zA-Z0-9_]', '_')
+            writeFile file: ".tmp_merged_${safeKey}.json", text: raw
+            def parsed = readJSON file: ".tmp_merged_${safeKey}.json"
+            if (!parsed || parsed.size() == 0) break
+
+            log 'DEBUG', "Project ${projectId} page ${page}: ${parsed.size()} merged MRs returned"
+
+            parsed.each { mr ->
+                def branch   = mr['source_branch']?.toString()?.toLowerCase() ?: ''
+                def mergedBy = mr['merge_user']?.username?.toString()?.toLowerCase() ?: ''
+
+                // Stop paging once updated_at is older than pipeline start
+                def updatedAt = parseDate(mr['updated_at']?.toString() ?: '')
+                if (updatedAt && updatedAt.before(pipelineStartDate)) {
+                    keepPaging = false
+                    log 'DEBUG', "  Stopping page scan — updated_at ${mr['updated_at']} is before pipeline start"
+                    return
+                }
+
+                // FIX: Only include MRs whose merged_at is AT or AFTER pipeline start
+                def mergedAt = parseDate(mr['merged_at']?.toString() ?: '')
+                if (!mergedAt || mergedAt.before(pipelineStartDate)) {
+                    log 'DEBUG', "  MR !${mr['iid']} skipped — merged_at ${mr['merged_at']} is before pipeline start ${pipelineStartDate.format('yyyy-MM-dd HH:mm z')}"
+                    return
+                }
+
+                def isRenovate   = branch.startsWith('renovate/') || branch.startsWith('docker-renovate/')
+                def isAutoMerged = mergedBy.contains("renovate") || mergedBy == botUsername.toLowerCase()
+
+                log 'DEBUG', "  MR !${mr['iid']} | branch=${branch} | merged_by=${mergedBy} | isRenovate=${isRenovate} | isAutoMerged=${isAutoMerged} | merged_at=${mr['merged_at']}"
+
+                if (isRenovate && isAutoMerged) {
+                    def key = "${mr['project_id']}_${mr['iid']}"
+                    if (!seenKeys.contains(key)) {
+                        seenKeys << key
+                        patches << mr
+                        log 'INFO', "  Automerged MR: !${mr['iid']} | ${mr['source_branch']} | merged_at: ${mr['merged_at']}"
+                    }
+                }
+            }
+            page++
+        }
+    }
+
+    log 'INFO', "fetchAutomergedPatches total: ${patches.size()} since pipeline start"
+    return patches
+}
+
+// ================================================================
+//  HELPER FUNCTIONS
+// ================================================================
+
+def log(String level, String msg) { echo "[${level}] ${msg}" }
+
+def resolveEmail(def emailsMap, String username) {
+    def email = emailsMap[username]?.toString()
+    if (!email) {
+        def matchKey = emailsMap.keySet().find { k -> k.toString().equalsIgnoreCase(username) }
+        email = matchKey ? emailsMap[matchKey].toString() : null
+    }
+    return email
+}
+
+def isDockerfileMR(String branch, String title, List labels) {
+    def b = branch.toLowerCase()
+    def t = title.toLowerCase()
+    return labels.any { it.toString().toLowerCase() == 'dockerfile' } ||
+           b.startsWith('docker-') || b.contains('dockerfile') ||
+           t.contains('docker tag') || t.contains('dockerfile')
+}
+
+def resolveRepoReviewers(String repoPath, List rules) {
+    def assigned = [] as Set
+    rules.each { rule ->
+        rule['matchRepositories']?.each { pattern ->
+            if (repoPath.toLowerCase() == pattern.toString().toLowerCase()) {
+                assigned.addAll(rule['reviewers'] ?: [])
+            }
+        }
+    }
+    return assigned.toList()
+}
+
+def classifyUpdateType(List labels, String branch, String title) {
+    if (labels.contains('major')) return 'major'
+    if (labels.contains('minor')) return 'minor'
+    if (labels.contains('patch')) return 'patch'
+    def b = branch.toLowerCase(); def t = title.toLowerCase()
+    if (b.contains('major') || t.contains('major')) return 'major'
+    if (b.contains('minor') || t.contains('minor')) return 'minor'
+    if (b.contains('patch') || t.contains('patch')) return 'patch'
+    return 'other'
+}
+
+def matchesRepository(def mr, List repoFilter) {
+    if (!repoFilter) return true
+    def repoPath = parseRepoPath(mr['web_url']?.toString() ?: '').toLowerCase()
+    return repoFilter.any { pattern ->
+        pattern.endsWith('*') ? repoPath.startsWith(pattern[0..-2]) : repoPath == pattern
+    }
+}
+
+def fetchAllMRs(String apiBase, String botUsername, String state) {
+    def allMRs = []
+    def page   = 1
+    while (page <= 10) {
+        def url = "${apiBase}/merge_requests?author_username=${botUsername}&state=${state}&per_page=100&page=${page}&order_by=created_at&sort=desc"
+        def raw = sh(script: 'curl -sf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "' + url + '"', returnStdout: true).trim()
+        if (!raw || raw == '[]') break
+        writeFile file: ".tmp_mrs_${state}_page_${page}.json", text: raw
+        def parsed = readJSON file: ".tmp_mrs_${state}_page_${page}.json"
+        if (!parsed || parsed.size() == 0) break
+        allMRs.addAll(parsed)
+        page++
+    }
+    return allMRs
+}
+
+def parseDate(String dateStr) {
+    if (!dateStr) return null
+    def fmts = ["yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", "yyyy-MM-dd'T'HH:mm:ss'Z'"]
+    for (fmt in fmts) {
+        try {
+            def sdf = new java.text.SimpleDateFormat(fmt)
+            sdf.setTimeZone(TimeZone.getTimeZone('UTC'))
+            return sdf.parse(dateStr)
+        } catch (Exception ignored) {}
+    }
+    return null
+}
+
+def parseRepoName(String webUrl) {
+    try {
+        def parts = webUrl.split('/')
+        def idx   = parts.findIndexOf { it == '-' }
+        return idx > 0 ? parts[idx - 1] : 'unknown'
+    } catch (Exception e) { return 'unknown' }
+}
+
+def parseRepoPath(String webUrl) {
+    try {
+        def stripped = webUrl.replaceFirst('https?://[^/]+/', '')
+        def idx     = stripped.indexOf('/-/')
+        return idx > 0 ? stripped.substring(0, idx) : 'unknown'
+    } catch (Exception e) { return 'unknown' }
+}
+
+def sendMail(Map args) {
+    def params = [to: args.to, subject: args.subject, mimeType: 'text/html', charset: 'UTF-8', body: args.body]
+    if (args.cc) params['cc'] = args.cc
+    mail(params)
+}
+
+// ================================================================
+//  EMAIL TEMPLATES
+// ================================================================
+
+def emailHeader(String title) {
+    return """<html><head></head>
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#333;margin:0;padding:20px;">
+<h2 style="color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:8px;">${title}</h2>
+<p style="color:#888;font-size:12px;margin-top:0;">Generated: ${new Date().format('yyyy-MM-dd HH:mm z')}</p>"""
+}
+
+def emailFooter(String buildUrl, String buildNumber) {
+    return """<p style="margin-top:30px;font-size:0.82em;color:#aaa;border-top:1px solid #eee;padding-top:10px;">
+  Jenkins Build: <a href="${buildUrl}" style="color:#2980b9;text-decoration:none;">#${buildNumber}</a> &nbsp;|&nbsp;
+  Powered by <strong>Renovate Bot</strong></p></body></html>"""
+}
+
+def badgeSpan(String color, String text) {
+    return """<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:bold;margin-right:3px;background:${color};color:#fff;">${text}</span>"""
+}
+
+def buildMergedMRListUrl(String repoPath) {
+    def gitlabHost = 'https://gitlab.example.com'
+    def cleanPath  = repoPath.toLowerCase()
+    return "${gitlabHost}/${cleanPath}/-/merge_requests?sort=created_date&state=merged&first_page_size=100"
+}
+
+// ── Summary Block ────────────────────────────────────────────────
+
+def renderSummaryBlock(List newMRs, List oldMRs, List enrichedAutomerged) {
+    def newMajor = newMRs.findAll { it.updateType == 'major' }.size()
+    def newMinor = newMRs.findAll { it.updateType == 'minor' }.size()
+    def newPatch = newMRs.findAll { it.updateType == 'patch' }.size()
+    def oldMajor = oldMRs.findAll { it.updateType == 'major' }.size()
+    def oldMinor = oldMRs.findAll { it.updateType == 'minor' }.size()
+    def oldPatch = oldMRs.findAll { it.updateType == 'patch' }.size()
+
+    def cs = 'width:48%;vertical-align:top;padding:0;background:transparent;border:none;'
+    def ls = 'font-size:13px;color:#555;padding:3px 0;background:transparent;border:none;'
+    def vs = 'font-size:13px;font-weight:bold;color:#2c3e50;padding:3px 0 3px 10px;background:transparent;border:none;'
+    def hs = 'font-size:13px;font-weight:bold;color:#2980b9;padding:4px 0 6px 0;background:transparent;border:none;'
+
+    return """<div style="background:#eaf4fb;border:1px solid #3498db;border-radius:6px;padding:16px 20px;margin-bottom:24px;">
+  <table style="width:100%;border-collapse:collapse;">
+    <tr>
+      <td style="${cs}padding-right:20px;">
+        <table style="width:100%;border-collapse:collapse;">
+          <tr><td colspan="2" style="${hs}">&#128680; New (this pipeline run) — ${newMRs.size()} MR${newMRs.size() != 1 ? 's' : ''}</td></tr>
+          <tr><td style="${ls}">Major open</td><td style="${vs}">${newMajor}</td></tr>
+          <tr><td style="${ls}">Minor open</td><td style="${vs}">${newMinor}</td></tr>
+          <tr><td style="${ls}">Patch open</td><td style="${vs}">${newPatch}</td></tr>
+          <tr><td style="${ls}">Auto-merged (this run)</td><td style="${vs}">${enrichedAutomerged.size()}</td></tr>
+        </table>
+      </td>
+      <td style="${cs}border-left:2px solid #b3d4ea;padding-left:20px;">
+        <table style="width:100%;border-collapse:collapse;">
+          <tr><td colspan="2" style="${hs}">&#128337; Old Open — ${oldMRs.size()} MR${oldMRs.size() != 1 ? 's' : ''}</td></tr>
+          <tr><td style="${ls}">Major open</td><td style="${vs}">${oldMajor}</td></tr>
+          <tr><td style="${ls}">Minor open</td><td style="${vs}">${oldMinor}</td></tr>
+          <tr><td style="${ls}">Patch open</td><td style="${vs}">${oldPatch}</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>"""
+}
+
+// ── MR Detail Table ──────────────────────────────────────────────
+
+def buildMRTable(List mrs) {
+    def typeColors = [major: '#e67e22', minor: '#3498db', patch: '#27ae60', other: '#95a5a6']
+    def td = 'padding:7px 10px;border-bottom:1px solid #ddd;vertical-align:top;font-size:13px;'
+    def rows = ''
+    mrs.eachWithIndex { mr, idx ->
+        def typeBadge   = badgeSpan(typeColors[mr.updateType] ?: '#95a5a6', mr.updateType.toUpperCase())
+        def dockerBadge = mr.isDockerMR ? badgeSpan('#1abc9c', 'DOCKER') : ''
+        def ageBadge    = mr.isMerged ? badgeSpan('#8e44ad', 'AUTO-MERGED')
+                          : (mr.isNew ? badgeSpan('#e74c3c', 'NEW') : badgeSpan('#7f8c8d', 'OLD'))
+        // FIX 1: Only show the relevant reviewer column based on MR type
+        def reviewerDisplay = mr.isDockerMR
+            ? mr.dockerReviewers.collect { "@${it}" }.join(', ')
+            : mr.repoReviewers.collect { "@${it}" }.join(', ')
+        if (!reviewerDisplay) reviewerDisplay = '<em>—</em>'
+        def bg = idx % 2 == 0 ? '#ffffff' : '#f4f8fb'
+        rows += """<tr style="background:${bg};">
+  <td style="${td}">${mr.repo}</td>
+  <td style="${td}">${typeBadge}${dockerBadge}</td>
+  <td style="${td}"><a href="${mr.link}" style="color:#2980b9;text-decoration:none;">${mr.title}</a></td>
+  <td style="${td}"><code style="font-size:11px;">${mr.branch}</code></td>
+  <td style="${td}">${ageBadge}</td>
+  <td style="${td}">${reviewerDisplay}</td>
+</tr>"""
+    }
+    def th = 'background:#3498db;color:#fff;padding:8px 10px;text-align:left;font-size:13px;'
+    return """<table style="border-collapse:collapse;width:100%;margin-top:8px;margin-bottom:20px;">
+  <tr>
+    <th style="${th}width:12%;">Repo</th>
+    <th style="${th}width:14%;">Type</th>
+    <th style="${th}width:28%;">MR Title</th>
+    <th style="${th}width:20%;">Branch</th>
+    <th style="${th}width:10%;">Status</th>
+    <th style="${th}width:16%;">Reviewer</th>
+  </tr>${rows}</table>"""
+}
+
+// ── Automerged MR Table ──────────────────────────────────────────
+
+def buildAutomergedTable(List mrs) {
+    def typeColors = [major: '#f04f23ff', minor: '#3498db', patch: '#27ae60', other: '#95a5a6']
+    def td = 'padding:7px 10px;border-bottom:1px solid #ddd;vertical-align:top;font-size:13px;'
+    def rows = ''
+    mrs.eachWithIndex { mr, idx ->
+        def typeBadge   = badgeSpan(typeColors[mr.updateType] ?: '#27ae60', mr.updateType.toUpperCase())
+        def dockerBadge = mr.isDockerMR ? badgeSpan('#1abc9c', 'DOCKER') : ''
+        def bg = idx % 2 == 0 ? '#ffffff' : '#f4f8fb'
+        rows += """<tr style="background:${bg};">
+  <td style="${td}"><a href="${buildMergedMRListUrl(mr.repoPath)}" style="color:#2980b9;text-decoration:none;">${mr.repo}</a></td>
+  <td style="${td}">${typeBadge}${dockerBadge}</td>
+  <td style="${td}"><a href="${mr.link}" style="color:#2980b9;text-decoration:none;">${mr.title}</a></td>
+  <td style="${td}"><code style="font-size:11px;">${mr.branch}</code></td>
+  <td style="${td}">${mr.mergedAt ?: 'unknown'}</td>
+</tr>"""
+    }
+    def th = 'background:#3498db;color:#fff;padding:8px 10px;text-align:left;font-size:13px;'
+    return """<table style="border-collapse:collapse;width:100%;margin-top:8px;margin-bottom:20px;">
+  <tr>
+    <th style="${th}width:13%;">Repo</th>
+    <th style="${th}width:10%;">Type</th>
+    <th style="${th}width:37%;">MR Title</th>
+    <th style="${th}width:25%;">Branch</th>
+    <th style="${th}width:12%;">Merged At</th>
+  </tr>${rows}</table>"""
+}
+
+def buildReviewerMRTable(List mrs) {
+    def typeColors = [major: '#e67e22', minor: '#3498db', patch: '#27ae60', other: '#95a5a6']
+    def td = 'padding:7px 10px;border-bottom:1px solid #ddd;vertical-align:top;font-size:13px;'
+    def rows = ''
+    mrs.eachWithIndex { mr, idx ->
+        def typeBadge   = badgeSpan(typeColors[mr.updateType] ?: '#95a5a6', mr.updateType.toUpperCase())
+        def dockerBadge = mr.isDockerMR ? badgeSpan('#1abc9c', 'DOCKER') : ''
+        def ageBadge    = mr.isNew ? badgeSpan('#e74c3c', 'NEW') : badgeSpan('#7f8c8d', 'OLD')
+        def bg          = idx % 2 == 0 ? '#ffffff' : '#f4f8fb'
+        rows += """<tr style="background:${bg};">
+  <td style="${td}">${mr.repo}</td>
+  <td style="${td}">${typeBadge}${dockerBadge}</td>
+  <td style="${td}"><a href="${mr.link}" style="color:#2980b9;text-decoration:none;">${mr.title}</a></td>
+  <td style="${td}"><code style="font-size:11px;">${mr.branch}</code></td>
+  <td style="${td}">${ageBadge}</td>
+</tr>"""
+    }
+    def th = 'background:#3498db;color:#fff;padding:8px 10px;text-align:left;font-size:13px;'
+    return """<table style="border-collapse:collapse;width:100%;margin-top:8px;margin-bottom:20px;">
+  <tr>
+    <th style="${th}width:16%;">Repo</th>
+    <th style="${th}width:14%;">Type</th>
+    <th style="${th}width:38%;">MR Title</th>
+    <th style="${th}width:24%;">Branch</th>
+    <th style="${th}width:8%;">Age</th>
+  </tr>${rows}</table>"""
+}
+
+// ── Full Email Renderers ─────────────────────────────────────────
+
+def renderNoMrEmail(String botUsername, String buildUrl, String buildNumber) {
+    return emailHeader('Renovate — No Open Dependency MRs') +
+        """<p>No open Merge Requests found created by <strong>${botUsername}</strong>.</p>
+<p>All tracked dependencies are up to date.</p>""" +
+        emailFooter(buildUrl, buildNumber)
+}
+
+def renderLeadEmail(List enrichedMRs, List automergedMRs, String leadUsername, String botUsername, String buildUrl, String buildNumber) {
+    def newMRs = enrichedMRs.findAll { it.isNew }
+    def oldMRs = enrichedMRs.findAll { !it.isNew }
+
+    def h3S = 'color:#2c3e50;margin-top:28px;margin-bottom:6px;border-left:4px solid #3498db;padding-left:10px;'
+
+    def body = emailHeader("Renovate — ${enrichedMRs.size()} Open Dependency MR${enrichedMRs.size() > 1 ? 's' : ''} (Lead: @${leadUsername})")
+    body += """<p>Hi <strong>@${leadUsername}</strong>, here is the full summary of all open Renovate MRs.</p>"""
+    body += renderSummaryBlock(newMRs, oldMRs, automergedMRs)
+
+    if (newMRs) {
+        body += """<h3 style="${h3S}">&#128680; Newly Created — This Pipeline Run (${newMRs.size()})</h3>"""
+        body += renderMRSubsections(newMRs)
+    }
+
+    if (oldMRs) {
+        body += """<h3 style="${h3S}">&#128337; Old Open MRs (${oldMRs.size()})</h3>"""
+        body += renderMRSubsections(oldMRs)
+    }
+
+    body += """<h3 style="${h3S}">&#10003; Auto-Merged Patches — This Pipeline Run (${automergedMRs.size()})</h3>
+<p style="background:#eafaf1;border:1px solid #27ae60;border-radius:4px;padding:4px 10px;font-size:12px;color:#1e8449;display:inline-block;margin-bottom:6px;">
+  These patch MRs were automatically merged after passing compatibility tests during this pipeline run. No action required.</p>"""
+    body += automergedMRs ? buildAutomergedTable(automergedMRs) : '<p style="color:#888;">No auto-merged patches in this pipeline run.</p>'
+
+    body += emailFooter(buildUrl, buildNumber)
+    return body
+}
+
+def renderReviewerEmail(String username, List mrs, String reviewType, String buildUrl, String buildNumber) {
+    def newMRs   = mrs.findAll { it.isNew }
+    def oldMRs   = mrs.findAll { !it.isNew }
+    def isDocker = reviewType == 'docker'
+    def typeLabel = isDocker ? 'Dockerfile MR' : 'MR'
+    def emailTitle = isDocker
+        ? "Renovate — Dockerfile MRs Assigned to You (@${username})"
+        : "Renovate — Open MRs Assigned to You (@${username})"
+
+    def h3S = 'color:#2c3e50;margin-top:28px;margin-bottom:6px;border-left:4px solid #3498db;padding-left:10px;'
+
+    def body = emailHeader(emailTitle)
+    body += """<p>Hi <strong>@${username}</strong>, you have <strong>${mrs.size()}</strong> open <strong>${typeLabel}${mrs.size() > 1 ? 's' : ''}</strong> to review.</p>"""
+    body += renderSummaryBlock(newMRs, oldMRs, [])
+
+    if (newMRs) {
+        body += """<h3 style="${h3S}">&#128680; Newly Created — This Pipeline Run (${newMRs.size()})</h3>"""
+        body += renderMRSubsections(newMRs)
+    }
+    if (oldMRs) {
+        body += """<h3 style="${h3S}">&#128337; Old Open MRs (${oldMRs.size()})</h3>"""
+        body += renderMRSubsections(oldMRs)
+    }
+
+     body += """<p style="margin-top:14px;"><strong>Action required:</strong> Open each link, review the dependency changes, and approve or request changes.</p>"""
+    body += emailFooter(buildUrl, buildNumber)
+    return body
+}
+
+// ── Subsection renderers ─────────────────────────────────────────
+
+def renderMRSubsections(List mrs) {
+    def html = ''
+    def groups = [
+        [type: 'major', color: '#e67e22', label: 'Major'],
+        [type: 'minor', color: '#3498db', label: 'Minor'],
+        [type: 'patch', color: '#27ae60', label: 'Patch'],
+        [type: 'other', color: '#95a5a6', label: 'Other']
+    ]
+    groups.each { g ->
+        def subset = mrs.findAll { it.updateType == g.type }
+        if (subset) {
+            html += """<h4 style="margin:12px 0 4px 0;color:${g.color};">${g.label} (${subset.size()})</h4>"""
+            html += buildMRTable(subset)
+        }
+    }
+    return html
+}
+
+def renderReviewerSubsections(List mrs) {
+    def html = ''
+    def groups = [
+        [type: 'major', color: '#e67e22', label: 'Major'],
+        [type: 'minor', color: '#3498db', label: 'Minor'],
+        [type: 'patch', color: '#27ae60', label: 'Patch'],
+        [type: 'other', color: '#95a5a6', label: 'Other']
+    ]
+    groups.each { g ->
+        def subset = mrs.findAll { it.updateType == g.type }
+        if (subset) {
+            html += """<h4 style="margin:12px 0 4px 0;color:${g.color};">${g.label} (${subset.size()})</h4>"""
+            html += buildMRTable(subset)
+        }
+    }
+    return html
+}

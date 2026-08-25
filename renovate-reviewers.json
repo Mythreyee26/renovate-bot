@@ -1,0 +1,20 @@
+{
+  "reviewerRules": [
+    {
+      "description": "GenAI repo reviewer",
+      "matchRepositories": ["your-group/your-project/your-project-GenAI"],
+      "reviewers": ["LEAD_USERNAME"]
+    },
+    {
+      "description": "Frontend repo reviewer",
+      "matchRepositories": ["your-group/your-project/your-project-frontend"],
+      "reviewers": ["LEAD_USERNAME"]
+    },
+    {
+      "description": "Dockerfile reviewer",
+      "matchManagers": ["dockerfile"],
+      "reviewers": ["REVIEWER_TWO"]
+    }
+  ]
+}
+

@@ -1,0 +1,13 @@
+{
+  "lead": {
+    "username": "LEAD_USERNAME",
+    "email": "lead@example.com",
+    "cc": "cc@example.com"
+  },
+  "reviewers": {
+    "LEAD_USERNAME":  "lead@example.com",
+    "REVIEWER_TWO":   "reviewer2@example.com",
+    "REVIEWER_THREE": "reviewer3@example.com"
+  }
+}
+
